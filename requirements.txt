@@ -1,0 +1,11 @@
+appdirs==1.4.4
+argcomplete==3.6.3
+importlib_resources==6.5.2
+pillow==12.1.0
+python-barcode==0.16.1
+python-escpos==3.1
+PyYAML==6.0.3
+qrcode==8.2
+setuptools==80.10.1
+six==1.17.0
+websocket-client==1.9.0
