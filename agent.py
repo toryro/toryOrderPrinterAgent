@@ -1,9 +1,10 @@
 """
 toryOrder 프린터 에이전트
-- 백엔드 WebSocket에 연결해 NEW_ORDER / ORDER_CANCELLED 이벤트 수신 시 ESC/POS 출력
+- 백엔드 WebSocket에 연결해 NEW_ORDER / ORDER_CANCELLED / PAYMENT_COLLECTED 이벤트 수신 시 ESC/POS 출력
 - NETWORK / SERIAL / FILE 세 가지 프린터 타입 지원
 - 매장 설정(auto_kitchen_print, printer_config) 60초마다 자동 갱신
 - 연결 끊김 시 지수 백오프 자동 재접속 (성공 시 3초로 리셋)
+- 출력 양식: 주방 주문서 / 영수증 / 주문 취소 알림
 """
 
 import os
@@ -44,6 +45,7 @@ WS_SCHEME = "wss" if SERVER_URL.startswith("https") else "ws"
 _access_token       = None
 _auto_kitchen_print = True
 _printer_config     = "NONE"   # NONE | UNIFIED | SEPARATE
+_store_name         = ""
 _printer            = None
 _settings_lock      = threading.Lock()
 _poller_started     = False
@@ -76,12 +78,13 @@ def fetch_store_settings(token: str) -> dict:
 
 def apply_settings(settings: dict):
     """서버에서 받은 설정을 전역 상태에 반영. 변경된 항목만 로그 출력."""
-    global _auto_kitchen_print, _printer_config
+    global _auto_kitchen_print, _printer_config, _store_name
     with _settings_lock:
         prev_auto = _auto_kitchen_print
         prev_cfg  = _printer_config
         _auto_kitchen_print = settings.get("auto_kitchen_print", True)
         _printer_config     = settings.get("printer_config", "NONE")
+        _store_name         = settings.get("name", "")
 
     changed = []
     if prev_auto != _auto_kitchen_print:
@@ -136,7 +139,7 @@ def init_printer():
 
 
 # =========================================================
-# 신규 주문서 출력
+# 주방 주문서 출력
 # =========================================================
 def print_order(data: dict):
     order_num  = data.get("daily_number", data.get("order_id", "?"))
@@ -199,6 +202,106 @@ def _print_order_console(order_num, table_name, created_at, order_type, pay_labe
             print(f"    └ {opts}")
     print("-" * 34)
     print("     ★ 주방 전달 완료 ★")
+    print(f"{sep}\n")
+
+
+# =========================================================
+# 영수증 출력
+# =========================================================
+def print_receipt(data: dict):
+    order_num      = data.get("daily_number", data.get("order_id", "?"))
+    table_name     = data.get("table_name", "포장")
+    created_at     = data.get("created_at", "")[:16]
+    order_type     = "포장" if data.get("order_type") == "TAKEOUT" else "매장"
+    items          = data.get("items", [])
+    total_price    = data.get("total_price", 0)
+    payment_method = data.get("payment_method") or "-"
+    with _settings_lock:
+        store_name = _store_name
+
+    if _printer:
+        _print_receipt_escpos(order_num, table_name, created_at, order_type,
+                              items, total_price, payment_method, store_name)
+    else:
+        _print_receipt_console(order_num, table_name, created_at, order_type,
+                               items, total_price, payment_method, store_name)
+
+
+def _print_receipt_escpos(order_num, table_name, created_at, order_type,
+                          items, total_price, payment_method, store_name):
+    try:
+        p = _printer
+        p.set(align="center", bold=True, width=2, height=2)
+        p.text("영  수  증\n")
+        p.set(align="center", bold=False, width=1, height=1)
+        if store_name:
+            p.text(f"{store_name}\n")
+        p.text("=" * 32 + "\n")
+        p.set(align="left", bold=False)
+        p.text(f"영수증번호: #{order_num}   [{order_type}]\n")
+        p.text(f"일시: {created_at}\n")
+        p.text(f"테이블: {table_name}\n")
+        p.text("-" * 32 + "\n")
+        p.set(bold=True)
+        p.text(f"{'품목':<14}{'수량':>4}{'금액':>12}\n")
+        p.set(bold=False)
+        p.text("-" * 32 + "\n")
+        for item in items:
+            name  = item.get("menu_name", "")
+            qty   = item.get("quantity", 1)
+            price = item.get("unit_price", 0) * qty
+            p.text(f"{name:<14}{qty:>4}{price:>12,}\n")
+            opts = item.get("options", "")
+            if opts:
+                p.text(f"  └ {opts}\n")
+        p.text("=" * 32 + "\n")
+        tax = int(total_price / 11)
+        p.set(bold=False)
+        p.text(f"{'부가세(포함)':<20}{tax:>12,}\n")
+        p.set(align="center", bold=True, width=2, height=1)
+        p.text(f"합계: {total_price:,}원\n")
+        p.set(align="left", bold=False, width=1, height=1)
+        p.text("=" * 32 + "\n")
+        p.text(f"결제수단: {payment_method}\n")
+        p.set(align="center", bold=False)
+        p.text("\n감사합니다. 또 방문해주세요!\n\n")
+        p.cut()
+    except Exception as e:
+        print(f"[프린터] ESC/POS 영수증 출력 오류: {e}")
+        _print_receipt_console(order_num, table_name, created_at, order_type,
+                               items, total_price, payment_method, store_name)
+
+
+def _print_receipt_console(order_num, table_name, created_at, order_type,
+                           items, total_price, payment_method, store_name):
+    sep = "=" * 36
+    print(f"\n{sep}")
+    print(f"          영  수  증")
+    if store_name:
+        print(f"         {store_name}")
+    print(sep)
+    print(f"  영수증번호: #{order_num}   [{order_type}]")
+    print(f"  일시    : {created_at}")
+    print(f"  테이블  : {table_name}")
+    print("-" * 36)
+    print(f"  {'품목':<14}{'수량':>4}{'금액':>14}")
+    print("-" * 36)
+    for item in items:
+        name  = item.get("menu_name", "")
+        qty   = item.get("quantity", 1)
+        price = item.get("unit_price", 0) * qty
+        print(f"  {name:<14}{qty:>4}{price:>14,}")
+        opts = item.get("options", "")
+        if opts:
+            print(f"    └ {opts}")
+    print("=" * 36)
+    tax = int(total_price / 11)
+    print(f"  {'부가세(포함)':<18}{tax:>14,}")
+    print("=" * 36)
+    print(f"  합  계  :  {total_price:,}원")
+    print(f"  결제수단:  {payment_method}")
+    print("-" * 36)
+    print("     감사합니다. 또 방문해주세요!")
     print(f"{sep}\n")
 
 
@@ -269,8 +372,22 @@ def on_message(ws, message):
             elif not auto:
                 print(f"[{ts}] 주문 수신 (자동출력 OFF, 건너뜀)")
             else:
-                print(f"[{ts}] 🔔 새 주문 수신 → 출력 시작")
+                is_post_pay = data.get("is_post_pay", True)
+                print(f"[{ts}] 🔔 새 주문 수신 → 주방 주문서 출력")
                 print_order(data)
+                # 선불 주문은 결제 완료 시점 = 주문 시점이므로 영수증 즉시 출력
+                if not is_post_pay:
+                    print(f"[{ts}] 🧾 선불 주문 → 영수증 출력")
+                    print_receipt(data)
+
+        elif msg_type == "PAYMENT_COLLECTED":
+            with _settings_lock:
+                cfg = _printer_config
+
+            if cfg != "NONE":
+                order_num = data.get("daily_number", data.get("order_id", "?"))
+                print(f"[{ts}] 💳 후불 수납 완료 #{order_num} → 영수증 출력")
+                print_receipt(data)
 
         elif msg_type == "ORDER_CANCELLED":
             with _settings_lock:
